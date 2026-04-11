@@ -35,6 +35,7 @@ class NavDPRos2BagRunner(Node):
         self.timeout = args.timeout
         self.reset_timeout = args.reset_timeout
         self.print_server_json = args.print_server_json
+        self.vis_http_ref = args.vis_http_ref
 
         self.rgb_topic = args.rgb_topic
         self.depth_topic = args.depth_topic
@@ -51,6 +52,8 @@ class NavDPRos2BagRunner(Node):
         self.last_send_time = 0.0
         self.last_health_log_time = 0.0
         self._reset_done = False
+        self._vis_window_name = "NavDP HTTP Trajectory"
+        self._vis_enabled = self.vis_http_ref
         self._lock = threading.Lock()
 
         self._session = requests.Session()
@@ -77,6 +80,10 @@ class NavDPRos2BagRunner(Node):
         self.get_logger().info(f"Server: {self.server_base}")
         self.get_logger().info(f"RGB topic: {self.rgb_topic}")
         self.get_logger().info(f"Depth topic: {self.depth_topic}")
+        if self.vis_http_ref:
+            self.get_logger().info(
+                "Visualization enabled: draw HTTP trajectory on uploaded RGB"
+            )
 
     def _on_rgb(self, msg: CompressedImage) -> None:
         image = self._decode_rgb(msg)
@@ -138,6 +145,154 @@ class NavDPRos2BagRunner(Node):
     def _camera_info_to_intrinsic(camera_info: CameraInfo) -> np.ndarray:
         k = np.array(camera_info.k, dtype=np.float32).reshape(3, 3)
         return k
+
+    @staticmethod
+    def _extract_traj_points(trajectory: np.ndarray) -> Optional[np.ndarray]:
+        if trajectory.size == 0:
+            return None
+
+        # Common layouts: (1, N, 3), (N, 3), (1, N, 2), (N, 2)
+        if trajectory.ndim == 3:
+            if trajectory.shape[0] >= 1:
+                pts = trajectory[0]
+            else:
+                return None
+        elif trajectory.ndim == 2:
+            pts = trajectory
+        else:
+            return None
+
+        if pts.shape[-1] < 2:
+            return None
+
+        return pts[:, :2].astype(np.float32)
+
+    @staticmethod
+    def _draw_gaode_style_trajectory(
+        image_bgr: np.ndarray, pts_xy: np.ndarray
+    ) -> np.ndarray:
+        vis = image_bgr.copy()
+        h, w = vis.shape[:2]
+
+        if pts_xy.shape[0] < 2:
+            return vis
+
+        x_forward = pts_xy[:, 0]
+        y_left = pts_xy[:, 1]
+
+        valid = np.isfinite(x_forward) & np.isfinite(y_left)
+        if not np.any(valid):
+            return vis
+
+        x_forward = x_forward[valid]
+        y_left = y_left[valid]
+        if x_forward.size < 2:
+            return vis
+
+        # Bottom-center origin, projected to image for an intuitive
+        # path overlay.
+        origin_x = int(0.5 * w)
+        origin_y = int(0.9 * h)
+
+        max_forward = max(float(np.max(x_forward)), 0.5)
+        max_lateral = max(float(np.max(np.abs(y_left))), 0.5)
+        scale_y = (0.75 * h) / max_forward
+        scale_x = (0.45 * w) / max_lateral
+        px_per_m = max(10.0, min(scale_x, scale_y))
+
+        poly = []
+        for xf, yl in zip(x_forward, y_left):
+            px = int(round(origin_x + yl * px_per_m))
+            py = int(round(origin_y - xf * px_per_m))
+            poly.append((px, py))
+
+        if len(poly) < 2:
+            return vis
+
+        poly_np = np.array(poly, dtype=np.int32)
+
+        # Gaode-like route style: white halo + cyan main path.
+        cv2.polylines(
+            vis, [poly_np], isClosed=False, color=(255, 255, 255), thickness=10
+        )
+        cv2.polylines(
+            vis, [poly_np], isClosed=False, color=(255, 200, 30), thickness=6
+        )
+
+        # Add directional arrows along the route.
+        arrow_step = max(2, len(poly) // 6)
+        for idx in range(0, len(poly) - 1, arrow_step):
+            p0 = poly[idx]
+            p1 = poly[min(idx + 1, len(poly) - 1)]
+            cv2.arrowedLine(
+                vis,
+                p0,
+                p1,
+                color=(60, 120, 255),
+                thickness=3,
+                tipLength=0.35,
+            )
+
+        # Start / end markers.
+        cv2.circle(vis, poly[0], 7, (70, 255, 70), -1)
+        cv2.circle(vis, poly[-1], 8, (60, 120, 255), -1)
+        cv2.putText(
+            vis,
+            "Start",
+            (poly[0][0] + 8, poly[0][1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (70, 255, 70),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            vis,
+            "Goal",
+            (poly[-1][0] + 8, poly[-1][1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (60, 120, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        return vis
+
+    def _show_vis(self, image_bgr: np.ndarray, trajectory: np.ndarray) -> None:
+        if not self._vis_enabled:
+            return
+
+        pts_xy = self._extract_traj_points(trajectory)
+        if pts_xy is None:
+            return
+
+        try:
+            vis = self._draw_gaode_style_trajectory(image_bgr, pts_xy)
+            cv2.imshow(self._vis_window_name, vis)
+            # Keep GUI responsive.
+            cv2.waitKey(1)
+        except cv2.error as exc:
+            self.get_logger().error(
+                "OpenCV visualization failed, disable vis_http_ref. "
+                f"detail={exc}"
+            )
+            self._vis_enabled = False
+
+    def _log_trajectory_values(self, trajectory: np.ndarray) -> None:
+        if trajectory.size == 0:
+            self.get_logger().info("trajectory_data: []")
+            return
+
+        traj_str = np.array2string(
+            trajectory,
+            precision=4,
+            suppress_small=True,
+            separator=", ",
+            max_line_width=120,
+            threshold=1000000,
+        )
+        self.get_logger().info(f"trajectory_data:\n{traj_str}")
 
     def _ensure_reset(self) -> bool:
         with self._lock:
@@ -298,16 +453,21 @@ class NavDPRos2BagRunner(Node):
             body = resp.text
             self.get_logger().info(f"nogoal_step HTTP {resp.status_code}")
 
-            if self.print_server_json:
+            if self.print_server_json or self._vis_enabled:
                 try:
                     parsed = json.loads(body)
                     traj = np.array(parsed.get("trajectory", []))
                     all_values = np.array(parsed.get("all_values", []))
-                    self.get_logger().info(
-                        "server response: "
-                        "trajectory_shape="
-                        f"{traj.shape}, all_values_shape={all_values.shape}"
-                    )
+                    if self.print_server_json:
+                        self.get_logger().info(
+                            "server response: "
+                            "trajectory_shape="
+                            f"{traj.shape}, "
+                            f"all_values_shape={all_values.shape}"
+                        )
+                        self._log_trajectory_values(traj)
+                    if self._vis_enabled:
+                        self._show_vis(rgb, traj)
                 except Exception:
                     self.get_logger().info(
                         f"server raw response: {body[:500]}"
@@ -340,6 +500,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-timeout", type=float, default=120.0)
     parser.add_argument("--stop-threshold", type=float, default=-0.5)
     parser.add_argument("--print-server-json", action="store_true")
+    parser.add_argument(
+        "--vis-http-ref",
+        action="store_true",
+        help="Overlay HTTP trajectory on uploaded RGB and show in real time",
+    )
 
     parser.add_argument(
         "--rgb-topic",
@@ -376,6 +541,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 
