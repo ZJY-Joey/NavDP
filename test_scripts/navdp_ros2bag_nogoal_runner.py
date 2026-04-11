@@ -26,6 +26,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
+from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
 
 
@@ -75,16 +76,46 @@ class NavDPRos2BagRunner(Node):
         self.cmd_filter_alpha = args.cmd_filter_alpha
         self.max_linear_acc = args.max_linear_acc
         self.max_angular_acc = args.max_angular_acc
+        self.cmd_forward_hz = args.cmd_forward_hz
+        self.cmd_source_timeout = args.cmd_source_timeout
+        self.autonomy_topic = args.autonomy_topic
+        self.autonomy_disable_topic = args.autonomy_disable_topic
+        self.teleop_cmd_topic = args.teleop_cmd_topic
+        self.autonomy_enabled = args.autonomy_default_enabled
         self._last_cmd_v = 0.0
         self._last_cmd_w = 0.0
         self._last_cmd_time = 0.0
+        self._algo_cmd_v = 0.0
+        self._algo_cmd_w = 0.0
+        self._algo_cmd_time = 0.0
+        self._teleop_cmd_v = 0.0
+        self._teleop_cmd_w = 0.0
+        self._teleop_cmd_time = 0.0
+        self._last_watchdog_warn_time = 0.0
         self._lock = threading.Lock()
 
         self._session = requests.Session()
         self._cmd_pub = None
+        self._cmd_mux_timer = None
         if self.control_output:
             self._cmd_pub = self.create_publisher(
                 Twist, self.cmd_vel_topic, 20
+            )
+            self.create_subscription(
+                Bool, self.autonomy_topic, self._on_autonomy_enable, 10
+            )
+            self.create_subscription(
+                Bool,
+                self.autonomy_disable_topic,
+                self._on_autonomy_disable,
+                10,
+            )
+            self.create_subscription(
+                Twist, self.teleop_cmd_topic, self._on_teleop_cmd, 20
+            )
+            self._cmd_mux_timer = self.create_timer(
+                1.0 / max(self.cmd_forward_hz, 1e-3),
+                self._publish_muxed_cmd,
             )
 
         self.create_subscription(
@@ -122,6 +153,14 @@ class NavDPRos2BagRunner(Node):
                 f"Control output enabled: publish cmd_vel to "
                 f"{self.cmd_vel_topic}"
             )
+            self.get_logger().info(
+                f"Autonomy control topics: on={self.autonomy_topic}, "
+                f"off={self.autonomy_disable_topic}, "
+                f"teleop={self.teleop_cmd_topic}"
+            )
+            self.get_logger().info(
+                f"Autonomy default enabled: {self.autonomy_enabled}"
+            )
 
     def _on_rgb(self, msg: CompressedImage) -> None:
         image = self._decode_rgb(msg)
@@ -157,6 +196,23 @@ class NavDPRos2BagRunner(Node):
                 self.all_static_transforms[(parent, child)] = (
                     self._transform_to_matrix(ts.transform)
                 )
+
+    def _on_autonomy_enable(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        self.autonomy_enabled = True
+        self.get_logger().info("Autonomy enabled by joystick topic")
+
+    def _on_autonomy_disable(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        self.autonomy_enabled = False
+        self.get_logger().info("Autonomy disabled by joystick topic")
+
+    def _on_teleop_cmd(self, msg: Twist) -> None:
+        self._teleop_cmd_v = float(msg.linear.x)
+        self._teleop_cmd_w = float(msg.angular.z)
+        self._teleop_cmd_time = time.time()
 
     @staticmethod
     def _decode_rgb(msg: CompressedImage) -> Optional[np.ndarray]:
@@ -266,6 +322,59 @@ class NavDPRos2BagRunner(Node):
         self._last_cmd_v = 0.0
         self._last_cmd_w = 0.0
 
+    def _publish_muxed_cmd(self) -> None:
+        if not self.control_output or self._cmd_pub is None:
+            return
+
+        now = time.time()
+        src_ok = False
+        v_target = 0.0
+        w_target = 0.0
+        src_name = "none"
+
+        if self.autonomy_enabled:
+            if now - self._algo_cmd_time <= self.cmd_source_timeout:
+                v_target = self._algo_cmd_v
+                w_target = self._algo_cmd_w
+                src_ok = True
+                src_name = "autonomy"
+            else:
+                src_name = "autonomy_timeout"
+        else:
+            if now - self._teleop_cmd_time <= self.cmd_source_timeout:
+                v_target = self._teleop_cmd_v
+                w_target = self._teleop_cmd_w
+                src_ok = True
+                src_name = "teleop"
+            else:
+                src_name = "teleop_timeout"
+
+        if not src_ok and now - self._last_watchdog_warn_time > 1.0:
+            self.get_logger().warn(
+                f"cmd watchdog fallback to zero, source={src_name}"
+            )
+            self._last_watchdog_warn_time = now
+
+        dt = 1.0 / max(self.cmd_forward_hz, 1e-3)
+        if self._last_cmd_time > 0.0:
+            dt = max(now - self._last_cmd_time, 1e-3)
+
+        dv_max = self.max_linear_acc * dt
+        dw_max = self.max_angular_acc * dt
+        v_cmd = self._apply_rate_limit(v_target, self._last_cmd_v, dv_max)
+        w_cmd = self._apply_rate_limit(w_target, self._last_cmd_w, dw_max)
+        v_cmd = self._clamp(
+            v_cmd, -self.max_linear_speed, self.max_linear_speed
+        )
+        w_cmd = self._clamp(
+            w_cmd, -self.max_angular_speed, self.max_angular_speed
+        )
+
+        self._publish_cmd(v_cmd, w_cmd)
+        self._last_cmd_v = v_cmd
+        self._last_cmd_w = w_cmd
+        self._last_cmd_time = now
+
     def _control_from_trajectory(
         self, trajectory: np.ndarray, odom: Optional[Odometry], now: float
     ) -> None:
@@ -315,10 +424,9 @@ class NavDPRos2BagRunner(Node):
         v_cmd = self._apply_rate_limit(v_filt, self._last_cmd_v, dv_max)
         w_cmd = self._apply_rate_limit(w_filt, self._last_cmd_w, dw_max)
 
-        self._publish_cmd(v_cmd, w_cmd)
-        self._last_cmd_v = v_cmd
-        self._last_cmd_w = w_cmd
-        self._last_cmd_time = now
+        self._algo_cmd_v = v_cmd
+        self._algo_cmd_w = w_cmd
+        self._algo_cmd_time = now
 
     @staticmethod
     def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
@@ -918,6 +1026,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmd-filter-alpha", type=float, default=0.7)
     parser.add_argument("--max-linear-acc", type=float, default=0.8)
     parser.add_argument("--max-angular-acc", type=float, default=1.5)
+    parser.add_argument("--cmd-forward-hz", type=float, default=20.0)
+    parser.add_argument("--cmd-source-timeout", type=float, default=0.4)
+    parser.add_argument(
+        "--autonomy-topic",
+        type=str,
+        default="/joystick_services/autonomy",
+    )
+    parser.add_argument(
+        "--autonomy-disable-topic",
+        type=str,
+        default="/joystick_services/autonomy_disable",
+    )
+    parser.add_argument(
+        "--teleop-cmd-topic",
+        type=str,
+        default="/cmd_vel_teleop",
+    )
+    parser.add_argument(
+        "--autonomy-default-enabled",
+        action="store_true",
+        help="Start with autonomy source enabled",
+    )
 
     parser.add_argument(
         "--rgb-topic",
