@@ -35,7 +35,7 @@ def navdp_reset():
                                 heads=8,
                                 token_dim=384,
                                 navi_model=args.checkpoint,
-                                device='cuda:0')
+                                device=args.device)
         navdp_navigator.reset(batchsize,threshold)
     else:
         navdp_navigator.reset(batchsize,threshold)
@@ -245,6 +245,9 @@ def navdp_step_ip_mixgoal():
                     'all_trajectory': all_trajectory.tolist(),
                     'all_values': all_values.tolist()})
     
+@app.route('/')
+def index():
+    return "NavDP Server is Running!"
 
 if __name__ == "__main__":
-    app.run(host='127.0.0.1',port=args.port)
+    app.run(host='0.0.0.0',port=args.port)
