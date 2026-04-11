@@ -10,3 +10,4 @@ assets/scenes/SkyTexture/*
 assets/scenes/embodiedscan/*
 bags/
 .vscode/
+test_logs/

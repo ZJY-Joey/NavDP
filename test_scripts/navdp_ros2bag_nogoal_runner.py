@@ -10,16 +10,19 @@ Usage:
 """
 
 import argparse
+import math
 import json
 import threading
 import time
-from typing import Optional, Tuple
+from collections import deque
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
 import requests
 import rclpy
 from requests import exceptions as req_exc
+from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
@@ -36,6 +39,7 @@ class NavDPRos2BagRunner(Node):
         self.reset_timeout = args.reset_timeout
         self.print_server_json = args.print_server_json
         self.vis_http_ref = args.vis_http_ref
+        self.control_output = args.control_output
 
         self.rgb_topic = args.rgb_topic
         self.depth_topic = args.depth_topic
@@ -47,16 +51,41 @@ class NavDPRos2BagRunner(Node):
         self.last_depth_m: Optional[np.ndarray] = None
         self.last_camera_info: Optional[CameraInfo] = None
         self.last_odom: Optional[Odometry] = None
-        self.last_tf_static: Optional[TFMessage] = None
+        # Accumulate static TF edges from all /tf_static messages.
+        self.all_static_transforms: Dict[Tuple[str, str], np.ndarray] = {}
 
         self.last_send_time = 0.0
         self.last_health_log_time = 0.0
         self._reset_done = False
         self._vis_window_name = "NavDP HTTP Trajectory"
         self._vis_enabled = self.vis_http_ref
+        self._last_tf_warn_time = 0.0
+        self.base_frame = args.base_frame
+        self.camera_optical_frame = args.camera_optical_frame
+        self.cmd_vel_topic = args.cmd_vel_topic
+        self.pp_gain_v = args.pp_gain_v
+        self.pp_gain_w = args.pp_gain_w
+        self.pp_gain_theta = args.pp_gain_theta
+        self.pp_use_yaw_term = args.pp_use_yaw_term
+        self.pp_speed_switch = args.pp_speed_switch
+        self.pp_lookahead_slow = args.pp_lookahead_slow
+        self.pp_lookahead_fast = args.pp_lookahead_fast
+        self.max_linear_speed = args.max_linear_speed
+        self.max_angular_speed = args.max_angular_speed
+        self.cmd_filter_alpha = args.cmd_filter_alpha
+        self.max_linear_acc = args.max_linear_acc
+        self.max_angular_acc = args.max_angular_acc
+        self._last_cmd_v = 0.0
+        self._last_cmd_w = 0.0
+        self._last_cmd_time = 0.0
         self._lock = threading.Lock()
 
         self._session = requests.Session()
+        self._cmd_pub = None
+        if self.control_output:
+            self._cmd_pub = self.create_publisher(
+                Twist, self.cmd_vel_topic, 20
+            )
 
         self.create_subscription(
             CompressedImage, self.rgb_topic, self._on_rgb, 20
@@ -83,6 +112,15 @@ class NavDPRos2BagRunner(Node):
         if self.vis_http_ref:
             self.get_logger().info(
                 "Visualization enabled: draw HTTP trajectory on uploaded RGB"
+            )
+            self.get_logger().info(
+                f"Projection frames: base={self.base_frame}, "
+                f"camera_optical={self.camera_optical_frame}"
+            )
+        if self.control_output:
+            self.get_logger().info(
+                f"Control output enabled: publish cmd_vel to "
+                f"{self.cmd_vel_topic}"
             )
 
     def _on_rgb(self, msg: CompressedImage) -> None:
@@ -111,7 +149,14 @@ class NavDPRos2BagRunner(Node):
 
     def _on_tf_static(self, msg: TFMessage) -> None:
         with self._lock:
-            self.last_tf_static = msg
+            for ts in msg.transforms:
+                parent = ts.header.frame_id.strip("/")
+                child = ts.child_frame_id.strip("/")
+                if not parent or not child:
+                    continue
+                self.all_static_transforms[(parent, child)] = (
+                    self._transform_to_matrix(ts.transform)
+                )
 
     @staticmethod
     def _decode_rgb(msg: CompressedImage) -> Optional[np.ndarray]:
@@ -166,6 +211,320 @@ class NavDPRos2BagRunner(Node):
             return None
 
         return pts[:, :2].astype(np.float32)
+
+    @staticmethod
+    def _extract_traj_pose(trajectory: np.ndarray) -> Optional[np.ndarray]:
+        if trajectory.size == 0:
+            return None
+        if trajectory.ndim == 3 and trajectory.shape[0] >= 1:
+            pts = trajectory[0]
+        elif trajectory.ndim == 2:
+            pts = trajectory
+        else:
+            return None
+        if pts.shape[-1] < 2:
+            return None
+        return pts.astype(np.float32)
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    def _select_lookahead_index(
+        self, pts: np.ndarray, current_speed: float
+    ) -> int:
+        if pts.shape[0] == 0:
+            return 0
+        idx = self.pp_lookahead_fast
+        if current_speed < self.pp_speed_switch:
+            idx = self.pp_lookahead_slow
+        return int(self._clamp(float(idx), 0.0, float(pts.shape[0] - 1)))
+
+    def _apply_rate_limit(
+        self, target: float, last: float, max_delta: float
+    ) -> float:
+        if target > last + max_delta:
+            return last + max_delta
+        if target < last - max_delta:
+            return last - max_delta
+        return target
+
+    def _publish_cmd(self, v_cmd: float, w_cmd: float) -> None:
+        if self._cmd_pub is None:
+            return
+        msg = Twist()
+        msg.linear.x = float(v_cmd)
+        msg.angular.z = float(w_cmd)
+        self._cmd_pub.publish(msg)
+
+    def _publish_stop_cmd(self) -> None:
+        self._publish_cmd(0.0, 0.0)
+        self._last_cmd_v = 0.0
+        self._last_cmd_w = 0.0
+
+    def _control_from_trajectory(
+        self, trajectory: np.ndarray, odom: Optional[Odometry], now: float
+    ) -> None:
+        if not self.control_output:
+            return
+
+        pts = self._extract_traj_pose(trajectory)
+        if pts is None or pts.shape[0] == 0:
+            self._publish_stop_cmd()
+            return
+
+        current_speed = abs(self._last_cmd_v)
+        if odom is not None:
+            current_speed = abs(odom.twist.twist.linear.x)
+
+        look_idx = self._select_lookahead_index(pts, current_speed)
+        target = pts[look_idx]
+        x = float(target[0])
+        y = float(target[1])
+        theta_target = float(target[2]) if target.shape[0] >= 3 else 0.0
+
+        ld = max(math.hypot(x, y), 1e-3)
+        alpha = math.atan2(y, x)
+
+        v_des = self.pp_gain_v * ld
+        v_des = self._clamp(v_des, 0.0, self.max_linear_speed)
+
+        w_des = self.pp_gain_w * alpha
+        if self.pp_use_yaw_term:
+            theta_current = 0.0
+            theta_err = self._normalize_angle(theta_target - theta_current)
+            w_des += self.pp_gain_theta * theta_err
+        w_des = self._clamp(
+            w_des, -self.max_angular_speed, self.max_angular_speed
+        )
+
+        alpha = self._clamp(self.cmd_filter_alpha, 0.0, 0.999)
+        v_filt = alpha * self._last_cmd_v + (1.0 - alpha) * v_des
+        w_filt = alpha * self._last_cmd_w + (1.0 - alpha) * w_des
+
+        dt = 1.0 / max(self.send_hz, 1e-3)
+        if self._last_cmd_time > 0.0:
+            dt = max(now - self._last_cmd_time, 1e-3)
+
+        dv_max = self.max_linear_acc * dt
+        dw_max = self.max_angular_acc * dt
+        v_cmd = self._apply_rate_limit(v_filt, self._last_cmd_v, dv_max)
+        w_cmd = self._apply_rate_limit(w_filt, self._last_cmd_w, dw_max)
+
+        self._publish_cmd(v_cmd, w_cmd)
+        self._last_cmd_v = v_cmd
+        self._last_cmd_w = w_cmd
+        self._last_cmd_time = now
+
+    @staticmethod
+    def _quat_to_rot(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+        n = qx * qx + qy * qy + qz * qz + qw * qw
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float32)
+        s = 2.0 / n
+        xx = qx * qx * s
+        yy = qy * qy * s
+        zz = qz * qz * s
+        xy = qx * qy * s
+        xz = qx * qz * s
+        yz = qy * qz * s
+        wx = qw * qx * s
+        wy = qw * qy * s
+        wz = qw * qz * s
+        return np.array(
+            [
+                [1.0 - (yy + zz), xy - wz, xz + wy],
+                [xy + wz, 1.0 - (xx + zz), yz - wx],
+                [xz - wy, yz + wx, 1.0 - (xx + yy)],
+            ],
+            dtype=np.float32,
+        )
+
+    @classmethod
+    def _transform_to_matrix(cls, transform) -> np.ndarray:
+        t = transform.translation
+        q = transform.rotation
+        r = cls._quat_to_rot(q.x, q.y, q.z, q.w)
+        mat = np.eye(4, dtype=np.float32)
+        mat[:3, :3] = r
+        mat[:3, 3] = np.array([t.x, t.y, t.z], dtype=np.float32)
+        return mat
+
+    @staticmethod
+    def _invert_transform(mat: np.ndarray) -> np.ndarray:
+        inv = np.eye(4, dtype=np.float32)
+        r = mat[:3, :3]
+        t = mat[:3, 3]
+        rt = r.T
+        inv[:3, :3] = rt
+        inv[:3, 3] = -rt @ t
+        return inv
+
+    def _find_transform_matrix(
+        self, source_frame: str, target_frame: str
+    ) -> Optional[np.ndarray]:
+        if source_frame == target_frame:
+            return np.eye(4, dtype=np.float32)
+
+        with self._lock:
+            tf_snapshot = dict(self.all_static_transforms)
+
+        graph = {}
+        for (parent, child), t_parent_child in tf_snapshot.items():
+            t_child_parent = self._invert_transform(t_parent_child)
+            graph.setdefault(parent, []).append((child, t_parent_child))
+            graph.setdefault(child, []).append((parent, t_child_parent))
+
+        source = source_frame.strip("/")
+        target = target_frame.strip("/")
+        if source not in graph or target not in graph:
+            return None
+
+        queue = deque([(source, np.eye(4, dtype=np.float32))])
+        visited = {source}
+
+        while queue:
+            cur, t_cur_source = queue.popleft()
+            if cur == target:
+                return t_cur_source
+            for nxt, t_nxt_cur in graph.get(cur, []):
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                t_nxt_source = t_nxt_cur @ t_cur_source
+                queue.append((nxt, t_nxt_source))
+
+        return None
+
+    @staticmethod
+    def _project_points(
+        pts_base: np.ndarray, t_cam_base: np.ndarray, k: np.ndarray
+    ) -> Optional[np.ndarray]:
+        if pts_base.shape[0] == 0:
+            return None
+
+        ones = np.ones((pts_base.shape[0], 1), dtype=np.float32)
+        pts_base_h = np.concatenate([pts_base, ones], axis=1)
+        pts_cam_h = (t_cam_base @ pts_base_h.T).T
+        pts_cam = pts_cam_h[:, :3]
+
+        z = pts_cam[:, 2]
+        valid = z > 1e-3
+        if np.count_nonzero(valid) < 2:
+            return None
+
+        x = pts_cam[valid, 0] / z[valid]
+        y = pts_cam[valid, 1] / z[valid]
+        fx = float(k[0, 0])
+        fy = float(k[1, 1])
+        cx = float(k[0, 2])
+        cy = float(k[1, 2])
+        u = fx * x + cx
+        v = fy * y + cy
+        return np.stack([u, v], axis=1)
+
+    def _draw_projected_trajectory(
+        self,
+        image_bgr: np.ndarray,
+        trajectory: np.ndarray,
+        camera_info: CameraInfo,
+    ) -> Optional[np.ndarray]:
+        if trajectory.size == 0:
+            return None
+
+        if trajectory.ndim == 3 and trajectory.shape[0] >= 1:
+            pts = trajectory[0]
+        elif trajectory.ndim == 2:
+            pts = trajectory
+        else:
+            return None
+
+        if pts.shape[1] < 2:
+            return None
+
+        # Trajectory is treated as (x_forward, y_left, yaw); z is ground plane.
+        pts_base = np.stack(
+            [
+                pts[:, 0].astype(np.float32),
+                pts[:, 1].astype(np.float32),
+                np.zeros(pts.shape[0], dtype=np.float32),
+            ],
+            axis=1,
+        )
+
+        source_frame = self.base_frame
+        camera_frame = camera_info.header.frame_id or self.camera_optical_frame
+        t_cam_base = self._find_transform_matrix(source_frame, camera_frame)
+        if t_cam_base is None and camera_frame != self.camera_optical_frame:
+            t_cam_base = self._find_transform_matrix(
+                source_frame, self.camera_optical_frame
+            )
+
+        if t_cam_base is None:
+            now = time.time()
+            if now - self._last_tf_warn_time > 2.0:
+                self.get_logger().warn(
+                    "No TF chain from base to camera optical frame for "
+                    "3D projection. Fallback to 2D overlay. "
+                    f"base={source_frame}, "
+                    f"camera={camera_frame or self.camera_optical_frame}"
+                )
+                self._last_tf_warn_time = now
+            return None
+
+        k = self._camera_info_to_intrinsic(camera_info)
+        uv = self._project_points(pts_base, t_cam_base, k)
+        if uv is None or uv.shape[0] < 2:
+            return None
+
+        vis = image_bgr.copy()
+        poly = np.round(uv).astype(np.int32)
+        h, w = vis.shape[:2]
+        keep = (
+            (poly[:, 0] >= 0)
+            & (poly[:, 0] < w)
+            & (poly[:, 1] >= 0)
+            & (poly[:, 1] < h)
+        )
+        poly = poly[keep]
+        if poly.shape[0] < 2:
+            return None
+
+        cv2.polylines(
+            vis, [poly], isClosed=False, color=(255, 255, 255), thickness=10
+        )
+        cv2.polylines(
+            vis, [poly], isClosed=False, color=(255, 200, 30), thickness=6
+        )
+
+        step = max(2, poly.shape[0] // 6)
+        for idx in range(0, poly.shape[0] - 1, step):
+            cv2.arrowedLine(
+                vis,
+                tuple(poly[idx]),
+                tuple(poly[min(idx + 1, poly.shape[0] - 1)]),
+                color=(60, 120, 255),
+                thickness=3,
+                tipLength=0.35,
+            )
+
+        cv2.circle(vis, tuple(poly[0]), 7, (70, 255, 70), -1)
+        cv2.circle(vis, tuple(poly[-1]), 8, (60, 120, 255), -1)
+        cv2.putText(
+            vis,
+            "Projected 3D",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return vis
 
     @staticmethod
     def _draw_gaode_style_trajectory(
@@ -263,12 +622,22 @@ class NavDPRos2BagRunner(Node):
         if not self._vis_enabled:
             return
 
+        with self._lock:
+            camera_info = self.last_camera_info
+            has_static_tf = bool(self.all_static_transforms)
+
         pts_xy = self._extract_traj_points(trajectory)
         if pts_xy is None:
             return
 
         try:
-            vis = self._draw_gaode_style_trajectory(image_bgr, pts_xy)
+            vis = None
+            if camera_info is not None and has_static_tf:
+                vis = self._draw_projected_trajectory(
+                    image_bgr, trajectory, camera_info
+                )
+            if vis is None:
+                vis = self._draw_gaode_style_trajectory(image_bgr, pts_xy)
             cv2.imshow(self._vis_window_name, vis)
             # Keep GUI responsive.
             cv2.waitKey(1)
@@ -422,7 +791,7 @@ class NavDPRos2BagRunner(Node):
                 None if self.last_depth_m is None else self.last_depth_m.copy()
             )
             odom = self.last_odom
-            tf_static = self.last_tf_static
+            has_static_tf = bool(self.all_static_transforms)
 
         if rgb is None or depth_m is None:
             self.get_logger().info("Waiting for RGB + depth frames...")
@@ -434,7 +803,7 @@ class NavDPRos2BagRunner(Node):
 
         if odom is None:
             self.get_logger().warn("/mfla/dr_odom not received yet")
-        if tf_static is None:
+        if not has_static_tf:
             self.get_logger().warn("/tf_static not received yet")
 
         url = f"{self.server_base}/nogoal_step"
@@ -453,7 +822,11 @@ class NavDPRos2BagRunner(Node):
             body = resp.text
             self.get_logger().info(f"nogoal_step HTTP {resp.status_code}")
 
-            if self.print_server_json or self._vis_enabled:
+            if (
+                self.print_server_json
+                or self._vis_enabled
+                or self.control_output
+            ):
                 try:
                     parsed = json.loads(body)
                     traj = np.array(parsed.get("trajectory", []))
@@ -468,6 +841,8 @@ class NavDPRos2BagRunner(Node):
                         self._log_trajectory_values(traj)
                     if self._vis_enabled:
                         self._show_vis(rgb, traj)
+                    if self.control_output:
+                        self._control_from_trajectory(traj, odom, now)
                 except Exception:
                     self.get_logger().info(
                         f"server raw response: {body[:500]}"
@@ -505,6 +880,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Overlay HTTP trajectory on uploaded RGB and show in real time",
     )
+    parser.add_argument(
+        "--base-frame",
+        type=str,
+        default="base_link",
+        help="Trajectory source frame used for projection",
+    )
+    parser.add_argument(
+        "--camera-optical-frame",
+        type=str,
+        default="camera_color_optical_frame",
+        help="Target camera optical frame for projection fallback",
+    )
+    parser.add_argument(
+        "--control-output",
+        action="store_true",
+        help="Follow predicted trajectory and publish cmd_vel",
+    )
+    parser.add_argument(
+        "--cmd-vel-topic",
+        type=str,
+        default="/cmd_vel",
+    )
+    parser.add_argument("--pp-gain-v", type=float, default=0.8)
+    parser.add_argument("--pp-gain-w", type=float, default=1.6)
+    parser.add_argument("--pp-gain-theta", type=float, default=0.5)
+    parser.add_argument(
+        "--pp-use-yaw-term",
+        action="store_true",
+        help="Use yaw term from trajectory theta for angular control",
+    )
+    parser.add_argument("--pp-speed-switch", type=float, default=0.4)
+    parser.add_argument("--pp-lookahead-slow", type=int, default=2)
+    parser.add_argument("--pp-lookahead-fast", type=int, default=6)
+    parser.add_argument("--max-linear-speed", type=float, default=0.8)
+    parser.add_argument("--max-angular-speed", type=float, default=1.6)
+    parser.add_argument("--cmd-filter-alpha", type=float, default=0.7)
+    parser.add_argument("--max-linear-acc", type=float, default=0.8)
+    parser.add_argument("--max-angular-acc", type=float, default=1.5)
 
     parser.add_argument(
         "--rgb-topic",
@@ -541,6 +954,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if node.control_output:
+            node._publish_stop_cmd()
         cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
