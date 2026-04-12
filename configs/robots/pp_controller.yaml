@@ -1,15 +1,16 @@
 # Pure pursuit and cmd forwarding parameters for navdp_ros2bag_nogoal_runner
-pp_gain_v: 0.8
-pp_gain_w: 1.6
+pp_gain_v: 0.2
+pp_gain_w: 0.3
 pp_gain_theta: 0.5
 pp_use_yaw_term: false
-pp_speed_switch: 0.4
-pp_lookahead_slow: 2
-pp_lookahead_fast: 6
+pp_speed_low: 0.0
+pp_speed_high: 0.6
+pp_lookahead_dist_low: 1.0
+pp_lookahead_dist_high: 2.0
 
-max_linear_speed: 0.8
+max_linear_speed: 1.2
 max_angular_speed: 1.6
-cmd_filter_alpha: 0.7
+cmd_filter_alpha: 0.2
 max_linear_acc: 0.8
 max_angular_acc: 1.5
 

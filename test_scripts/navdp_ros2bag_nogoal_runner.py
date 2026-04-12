@@ -23,8 +23,8 @@ import numpy as np
 import requests
 import rclpy
 from requests import exceptions as req_exc
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import Bool
@@ -74,9 +74,10 @@ class NavDPRos2BagRunner(Node):
         self.pp_gain_w = args.pp_gain_w
         self.pp_gain_theta = args.pp_gain_theta
         self.pp_use_yaw_term = args.pp_use_yaw_term
-        self.pp_speed_switch = args.pp_speed_switch
-        self.pp_lookahead_slow = args.pp_lookahead_slow
-        self.pp_lookahead_fast = args.pp_lookahead_fast
+        self.pp_speed_low = args.pp_speed_low
+        self.pp_speed_high = args.pp_speed_high
+        self.pp_lookahead_dist_low = args.pp_lookahead_dist_low
+        self.pp_lookahead_dist_high = args.pp_lookahead_dist_high
         self.max_linear_speed = args.max_linear_speed
         self.max_angular_speed = args.max_angular_speed
         self.cmd_filter_alpha = args.cmd_filter_alpha
@@ -89,6 +90,8 @@ class NavDPRos2BagRunner(Node):
         self.autonomy_disable_topic = args.autonomy_disable_topic
         self.teleop_cmd_topic = args.teleop_cmd_topic
         self.autonomy_enabled = args.autonomy_default_enabled
+        self.waypoint_topic = args.waypoint_topic
+        self.waypoint_frame = args.waypoint_frame
         self._last_cmd_v = 0.0
         self._last_cmd_w = 0.0
         self._last_cmd_time = 0.0
@@ -105,6 +108,9 @@ class NavDPRos2BagRunner(Node):
 
         self._session = requests.Session()
         self._cmd_pub = None
+        self._waypoint_pub = self.create_publisher(
+            Path, self.waypoint_topic, 10
+        )
         self._cmd_mux_timer = None
         if self.control_output:
             self._cmd_pub = self.create_publisher(
@@ -170,6 +176,10 @@ class NavDPRos2BagRunner(Node):
             self.get_logger().info(
                 f"Autonomy default enabled: {self.autonomy_enabled}"
             )
+        self.get_logger().info(
+            f"Waypoint publishing enabled: topic={self.waypoint_topic}, "
+            f"frame={self.waypoint_frame}"
+        )
 
     def _load_pp_config(self, config_path: str) -> None:
         if not config_path:
@@ -179,6 +189,8 @@ class NavDPRos2BagRunner(Node):
                 "PyYAML is not installed, ignore --pp-config"
             )
             return
+
+        print("Loading pure pursuit config from: ", config_path)
 
         cfg_path = config_path
         if not os.path.isabs(cfg_path):
@@ -211,9 +223,13 @@ class NavDPRos2BagRunner(Node):
             "pp_gain_w": ("pp_gain_w", float),
             "pp_gain_theta": ("pp_gain_theta", float),
             "pp_use_yaw_term": ("pp_use_yaw_term", bool),
-            "pp_speed_switch": ("pp_speed_switch", float),
-            "pp_lookahead_slow": ("pp_lookahead_slow", int),
-            "pp_lookahead_fast": ("pp_lookahead_fast", int),
+            "pp_speed_low": ("pp_speed_low", float),
+            "pp_speed_high": ("pp_speed_high", float),
+            "pp_lookahead_dist_low": ("pp_lookahead_dist_low", float),
+            "pp_lookahead_dist_high": (
+                "pp_lookahead_dist_high",
+                float,
+            ),
             "max_linear_speed": ("max_linear_speed", float),
             "max_angular_speed": ("max_angular_speed", float),
             "cmd_filter_alpha": ("cmd_filter_alpha", float),
@@ -222,6 +238,15 @@ class NavDPRos2BagRunner(Node):
             "cmd_forward_hz": ("cmd_forward_hz", float),
             "cmd_source_timeout": ("cmd_source_timeout", float),
         }
+
+        # Backward compatibility for old index-based keys.
+        if "pp_speed_switch" in cfg and "pp_speed_high" not in cfg:
+            cfg["pp_speed_low"] = 0.0
+            cfg["pp_speed_high"] = float(cfg["pp_speed_switch"])
+        if "pp_lookahead_slow" in cfg and "pp_lookahead_dist_low" not in cfg:
+            cfg["pp_lookahead_dist_low"] = 0.4
+        if "pp_lookahead_fast" in cfg and "pp_lookahead_dist_high" not in cfg:
+            cfg["pp_lookahead_dist_high"] = 1.2
 
         applied = []
         for key, (attr, cast) in mapping.items():
@@ -365,18 +390,46 @@ class NavDPRos2BagRunner(Node):
         return math.atan2(math.sin(angle), math.cos(angle))
 
     @staticmethod
+    def _yaw_to_quaternion(yaw: float) -> Tuple[float, float, float, float]:
+        half = 0.5 * yaw
+        return (0.0, 0.0, math.sin(half), math.cos(half))
+
+    @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
+    def _select_lookahead_distance(self, current_speed: float) -> float:
+        v_low = self.pp_speed_low
+        v_high = self.pp_speed_high
+        d_low = self.pp_lookahead_dist_low
+        d_high = self.pp_lookahead_dist_high
+
+        if v_high <= v_low:
+            return max(0.05, d_high)
+
+        ratio = (current_speed - v_low) / (v_high - v_low)
+        ratio = self._clamp(ratio, 0.0, 1.0)
+        return max(0.05, d_low + ratio * (d_high - d_low))
+
     def _select_lookahead_index(
-        self, pts: np.ndarray, current_speed: float
+        self,
+        pts: np.ndarray,
+        lookahead_dist: float,
     ) -> int:
         if pts.shape[0] == 0:
             return 0
-        idx = self.pp_lookahead_fast
-        if current_speed < self.pp_speed_switch:
-            idx = self.pp_lookahead_slow
-        return int(self._clamp(float(idx), 0.0, float(pts.shape[0] - 1)))
+        if pts.shape[0] == 1:
+            return 0
+
+        accumulated = 0.0
+        for idx in range(1, pts.shape[0]):
+            dx = float(pts[idx, 0] - pts[idx - 1, 0])
+            dy = float(pts[idx, 1] - pts[idx - 1, 1])
+            accumulated += math.hypot(dx, dy)
+            if accumulated >= lookahead_dist:
+                return idx
+
+        return pts.shape[0] - 1
 
     def _apply_rate_limit(
         self, target: float, last: float, max_delta: float
@@ -399,6 +452,37 @@ class NavDPRos2BagRunner(Node):
         self._publish_cmd(0.0, 0.0)
         self._last_cmd_v = 0.0
         self._last_cmd_w = 0.0
+
+    def _publish_waypoints(self, trajectory: np.ndarray) -> None:
+        if self._waypoint_pub is None:
+            return
+
+        pts = self._extract_traj_pose(trajectory)
+        if pts is None or pts.shape[0] == 0:
+            return
+
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = self.waypoint_frame
+
+        for i in range(pts.shape[0]):
+            x = float(pts[i, 0])
+            y = float(pts[i, 1])
+            yaw = float(pts[i, 2]) if pts.shape[1] >= 3 else 0.0
+            qx, qy, qz, qw = self._yaw_to_quaternion(yaw)
+
+            pose = PoseStamped()
+            pose.header = path_msg.header
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.x = qx
+            pose.pose.orientation.y = qy
+            pose.pose.orientation.z = qz
+            pose.pose.orientation.w = qw
+            path_msg.poses.append(pose)
+
+        self._waypoint_pub.publish(path_msg)
 
     def _publish_muxed_cmd(self) -> None:
         if not self.control_output or self._cmd_pub is None:
@@ -434,13 +518,16 @@ class NavDPRos2BagRunner(Node):
             self._last_watchdog_warn_time = now
 
         dt = 1.0 / max(self.cmd_forward_hz, 1e-3)
+        alpha = self.cmd_filter_alpha
+        v_target_filt = alpha * self._last_cmd_v + (1.0 - alpha) * v_target
+        w_target_filt = alpha * self._last_cmd_w + (1.0 - alpha) * w_target
         if self._last_cmd_time > 0.0:
             dt = max(now - self._last_cmd_time, 1e-3)
 
         dv_max = self.max_linear_acc * dt
         dw_max = self.max_angular_acc * dt
-        v_cmd = self._apply_rate_limit(v_target, self._last_cmd_v, dv_max)
-        w_cmd = self._apply_rate_limit(w_target, self._last_cmd_w, dw_max)
+        v_cmd = self._apply_rate_limit(v_target_filt, self._last_cmd_v, dv_max)
+        w_cmd = self._apply_rate_limit(w_target_filt, self._last_cmd_w, dw_max)
         v_cmd = self._clamp(
             v_cmd, -self.max_linear_speed, self.max_linear_speed
         )
@@ -468,42 +555,43 @@ class NavDPRos2BagRunner(Node):
         if odom is not None:
             current_speed = abs(odom.twist.twist.linear.x)
 
-        look_idx = self._select_lookahead_index(pts, current_speed)
+        lookahead_dist = self._select_lookahead_distance(current_speed)
+        look_idx = self._select_lookahead_index(pts, lookahead_dist)
         target = pts[look_idx]
         x = float(target[0])
         y = float(target[1])
-        theta_target = float(target[2]) if target.shape[0] >= 3 else 0.0
 
         ld = max(math.hypot(x, y), 1e-3)
         alpha = math.atan2(y, x)
 
-        v_des = self.pp_gain_v * ld
-        v_des = self._clamp(v_des, 0.0, self.max_linear_speed)
+        # stop constraint of pp controller and constraint in pushlish muxed cmd
+        # v_des = self.pp_gain_v * ld
+        # v_des = self._clamp(v_des, 0.0, self.max_linear_speed)
 
-        w_des = self.pp_gain_w * alpha
-        if self.pp_use_yaw_term:
-            theta_current = 0.0
-            theta_err = self._normalize_angle(theta_target - theta_current)
-            w_des += self.pp_gain_theta * theta_err
-        w_des = self._clamp(
-            w_des, -self.max_angular_speed, self.max_angular_speed
-        )
+        # w_des = self.pp_gain_w * alpha
+        # if self.pp_use_yaw_term:
+        #     theta_current = 0.0
+        #     theta_err = self._normalize_angle(theta_target - theta_current)
+        #     w_des += self.pp_gain_theta * theta_err
+        # w_des = self._clamp(
+        #     w_des, -self.max_angular_speed, self.max_angular_speed
+        # )
 
-        alpha = self._clamp(self.cmd_filter_alpha, 0.0, 0.999)
-        v_filt = alpha * self._last_cmd_v + (1.0 - alpha) * v_des
-        w_filt = alpha * self._last_cmd_w + (1.0 - alpha) * w_des
+        # alpha = self._clamp(self.cmd_filter_alpha, 0.0, 0.999)
+        # v_filt = alpha * self._last_cmd_v + (1.0 - alpha) * v_des
+        # w_filt = alpha * self._last_cmd_w + (1.0 - alpha) * w_des
 
-        dt = 1.0 / max(self.send_hz, 1e-3)
-        if self._last_cmd_time > 0.0:
-            dt = max(now - self._last_cmd_time, 1e-3)
+        # dt = 1.0 / max(self.send_hz, 1e-3)
+        # if self._last_cmd_time > 0.0:
+        #     dt = max(now - self._last_cmd_time, 1e-3)
 
-        dv_max = self.max_linear_acc * dt
-        dw_max = self.max_angular_acc * dt
-        v_cmd = self._apply_rate_limit(v_filt, self._last_cmd_v, dv_max)
-        w_cmd = self._apply_rate_limit(w_filt, self._last_cmd_w, dw_max)
+        # dv_max = self.max_linear_acc * dt
+        # dw_max = self.max_angular_acc * dt
+        # v_cmd = self._apply_rate_limit(v_filt, self._last_cmd_v, dv_max)
+        # w_cmd = self._apply_rate_limit(w_filt, self._last_cmd_w, dw_max)
 
-        self._algo_cmd_v = v_cmd
-        self._algo_cmd_w = w_cmd
+        self._algo_cmd_v = self.pp_gain_v * ld
+        self._algo_cmd_w = self.pp_gain_w * alpha
         self._algo_cmd_time = now
 
     @staticmethod
@@ -1068,6 +1156,14 @@ class NavDPRos2BagRunner(Node):
                     parsed = json.loads(body)
                     traj = np.array(parsed.get("trajectory", []))
                     all_values = np.array(parsed.get("all_values", []))
+
+                    if self.control_output:
+                        self._control_from_trajectory(traj, odom, now)
+                        # HTTP callback may block timer scheduling; force one
+                        # mux cycle so overlay and output cmd_vel stay fresh.
+                        self._publish_muxed_cmd()
+                    self._publish_waypoints(traj)
+
                     if self.print_server_json:
                         self.get_logger().info(
                             "server response: "
@@ -1076,11 +1172,14 @@ class NavDPRos2BagRunner(Node):
                             f"all_values_shape={all_values.shape}"
                         )
                         self._log_trajectory_values(traj)
-                    if self.control_output:
-                        self._control_from_trajectory(traj, odom, now)
-                        # HTTP callback may block timer scheduling; force one
-                        # mux cycle so overlay and output cmd_vel stay fresh.
-                        self._publish_muxed_cmd()
+                        if self.control_output:
+                            self.get_logger().info(
+                                "computed cmd_vel: "
+                                f"algo(v={self._algo_cmd_v:.3f}, "
+                                f"w={self._algo_cmd_w:.3f}), "
+                                f"output(v={self._last_cmd_v:.3f}, "
+                                f"w={self._last_cmd_w:.3f})"
+                            )
                 except Exception:
                     self.get_logger().info(
                         f"server raw response: {body[:500]}"
@@ -1123,10 +1222,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--reset-timeout", type=float, default=120.0)
     parser.add_argument("--stop-threshold", type=float, default=-0.5)
-    parser.add_argument("--print-server-json", action="store_true")
+    parser.add_argument(
+        "--print-server-json",
+        action="store_true",
+        default=False,
+    )
     parser.add_argument(
         "--vis-http-ref",
         action="store_true",
+        default=False,
         help="Overlay HTTP trajectory on uploaded RGB and show in real time",
     )
     parser.add_argument(
@@ -1144,6 +1248,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--control-output",
         action="store_true",
+        default=False,
         help="Follow predicted trajectory and publish cmd_vel",
     )
     parser.add_argument(
@@ -1157,11 +1262,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pp-use-yaw-term",
         action="store_true",
+        default=False,
         help="Use yaw term from trajectory theta for angular control",
     )
-    parser.add_argument("--pp-speed-switch", type=float, default=0.4)
-    parser.add_argument("--pp-lookahead-slow", type=int, default=2)
-    parser.add_argument("--pp-lookahead-fast", type=int, default=6)
+    parser.add_argument("--pp-speed-low", type=float, default=0.0)
+    parser.add_argument("--pp-speed-high", type=float, default=0.6)
+    parser.add_argument(
+        "--pp-lookahead-dist-low",
+        type=float,
+        default=0.4,
+        help="Lookahead distance in meters at low speed",
+    )
+    parser.add_argument(
+        "--pp-lookahead-dist-high",
+        type=float,
+        default=1.2,
+        help="Lookahead distance in meters at high speed",
+    )
     parser.add_argument("--max-linear-speed", type=float, default=0.8)
     parser.add_argument("--max-angular-speed", type=float, default=1.6)
     parser.add_argument("--cmd-filter-alpha", type=float, default=0.7)
@@ -1169,6 +1286,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-angular-acc", type=float, default=1.5)
     parser.add_argument("--cmd-forward-hz", type=float, default=20.0)
     parser.add_argument("--cmd-source-timeout", type=float, default=0.4)
+    parser.add_argument(
+        "--waypoint-topic",
+        type=str,
+        default="/waypoint",
+        help="ROS2 topic to publish predicted trajectory as nav_msgs/Path",
+    )
+    parser.add_argument(
+        "--waypoint-frame",
+        type=str,
+        default="base_link",
+        help="Frame id used in published waypoint Path",
+    )
     parser.add_argument(
         "--autonomy-topic",
         type=str,
