@@ -12,6 +12,7 @@ Usage:
 import argparse
 import math
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -28,6 +29,11 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 class NavDPRos2BagRunner(Node):
@@ -78,6 +84,7 @@ class NavDPRos2BagRunner(Node):
         self.max_angular_acc = args.max_angular_acc
         self.cmd_forward_hz = args.cmd_forward_hz
         self.cmd_source_timeout = args.cmd_source_timeout
+        self.pp_config = args.pp_config
         self.autonomy_topic = args.autonomy_topic
         self.autonomy_disable_topic = args.autonomy_disable_topic
         self.teleop_cmd_topic = args.teleop_cmd_topic
@@ -93,6 +100,8 @@ class NavDPRos2BagRunner(Node):
         self._teleop_cmd_time = 0.0
         self._last_watchdog_warn_time = 0.0
         self._lock = threading.Lock()
+
+        self._load_pp_config(self.pp_config)
 
         self._session = requests.Session()
         self._cmd_pub = None
@@ -160,6 +169,75 @@ class NavDPRos2BagRunner(Node):
             )
             self.get_logger().info(
                 f"Autonomy default enabled: {self.autonomy_enabled}"
+            )
+
+    def _load_pp_config(self, config_path: str) -> None:
+        if not config_path:
+            return
+        if yaml is None:
+            self.get_logger().warn(
+                "PyYAML is not installed, ignore --pp-config"
+            )
+            return
+
+        cfg_path = config_path
+        if not os.path.isabs(cfg_path):
+            cfg_path = os.path.join(os.getcwd(), cfg_path)
+
+        if not os.path.exists(cfg_path):
+            self.get_logger().warn(
+                f"pp config not found, use CLI defaults: {cfg_path}"
+            )
+            return
+
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception as exc:
+            self.get_logger().warn(
+                f"failed to read pp config, use CLI defaults: {exc}"
+            )
+            return
+
+        if not isinstance(cfg, dict):
+            self.get_logger().warn(
+                "invalid pp config format (expect mapping), "
+                "use CLI defaults"
+            )
+            return
+
+        mapping = {
+            "pp_gain_v": ("pp_gain_v", float),
+            "pp_gain_w": ("pp_gain_w", float),
+            "pp_gain_theta": ("pp_gain_theta", float),
+            "pp_use_yaw_term": ("pp_use_yaw_term", bool),
+            "pp_speed_switch": ("pp_speed_switch", float),
+            "pp_lookahead_slow": ("pp_lookahead_slow", int),
+            "pp_lookahead_fast": ("pp_lookahead_fast", int),
+            "max_linear_speed": ("max_linear_speed", float),
+            "max_angular_speed": ("max_angular_speed", float),
+            "cmd_filter_alpha": ("cmd_filter_alpha", float),
+            "max_linear_acc": ("max_linear_acc", float),
+            "max_angular_acc": ("max_angular_acc", float),
+            "cmd_forward_hz": ("cmd_forward_hz", float),
+            "cmd_source_timeout": ("cmd_source_timeout", float),
+        }
+
+        applied = []
+        for key, (attr, cast) in mapping.items():
+            if key not in cfg:
+                continue
+            value = cfg[key]
+            if cast is bool:
+                casted = bool(value)
+            else:
+                casted = cast(value)
+            setattr(self, attr, casted)
+            applied.append(f"{key}={casted}")
+
+        if applied:
+            self.get_logger().info(
+                f"Loaded pp config: {cfg_path}; " + ", ".join(applied)
             )
 
     def _on_rgb(self, msg: CompressedImage) -> None:
@@ -726,26 +804,72 @@ class NavDPRos2BagRunner(Node):
 
         return vis
 
-    def _show_vis(self, image_bgr: np.ndarray, trajectory: np.ndarray) -> None:
-        if not self._vis_enabled:
-            return
+    def _draw_cmd_overlay(self, image_bgr: np.ndarray) -> np.ndarray:
+        vis = image_bgr.copy()
+        text = (
+            f"cmd_vel v={self._last_cmd_v:.3f} m/s  "
+            f"w={self._last_cmd_w:.3f} rad/s"
+        )
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.55
+        thickness = 2
+        (tw, th), baseline = cv2.getTextSize(
+            text, font, font_scale, thickness
+        )
+        x = max(10, vis.shape[1] - tw - 15)
+        y = max(th + 10, 20)
 
+        cv2.rectangle(
+            vis,
+            (x - 8, y - th - 8),
+            (x + tw + 8, y + baseline + 6),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            vis,
+            text,
+            (x, y),
+            font,
+            font_scale,
+            (0, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
+        return vis
+
+    def _show_vis(
+        self,
+        image_bgr: np.ndarray,
+        trajectory: Optional[np.ndarray] = None,
+    ) -> None:
         with self._lock:
             camera_info = self.last_camera_info
             has_static_tf = bool(self.all_static_transforms)
 
-        pts_xy = self._extract_traj_points(trajectory)
-        if pts_xy is None:
-            return
-
         try:
-            vis = None
-            if camera_info is not None and has_static_tf:
-                vis = self._draw_projected_trajectory(
-                    image_bgr, trajectory, camera_info
-                )
-            if vis is None:
-                vis = self._draw_gaode_style_trajectory(image_bgr, pts_xy)
+            vis = image_bgr.copy()
+            if self._vis_enabled and trajectory is not None:
+                pts_xy = self._extract_traj_points(trajectory)
+                if pts_xy is not None:
+                    if camera_info is not None and has_static_tf:
+                        vis_proj = self._draw_projected_trajectory(
+                            image_bgr, trajectory, camera_info
+                        )
+                        if vis_proj is not None:
+                            vis = vis_proj
+                        else:
+                            vis = self._draw_gaode_style_trajectory(
+                                image_bgr, pts_xy
+                            )
+                    else:
+                        vis = self._draw_gaode_style_trajectory(
+                            image_bgr, pts_xy
+                        )
+
+            if self.control_output:
+                vis = self._draw_cmd_overlay(vis)
+
             cv2.imshow(self._vis_window_name, vis)
             # Keep GUI responsive.
             cv2.waitKey(1)
@@ -902,11 +1026,14 @@ class NavDPRos2BagRunner(Node):
             has_static_tf = bool(self.all_static_transforms)
 
         if rgb is None or depth_m is None:
+            if rgb is not None:
+                self._show_vis(rgb)
             self.get_logger().info("Waiting for RGB + depth frames...")
             return
 
         now = time.time()
         if now - self.last_send_time < 1.0 / max(self.send_hz, 1e-3):
+            self._show_vis(rgb)
             return
 
         if odom is None:
@@ -930,6 +1057,8 @@ class NavDPRos2BagRunner(Node):
             body = resp.text
             self.get_logger().info(f"nogoal_step HTTP {resp.status_code}")
 
+            traj = None
+
             if (
                 self.print_server_json
                 or self._vis_enabled
@@ -947,14 +1076,20 @@ class NavDPRos2BagRunner(Node):
                             f"all_values_shape={all_values.shape}"
                         )
                         self._log_trajectory_values(traj)
-                    if self._vis_enabled:
-                        self._show_vis(rgb, traj)
                     if self.control_output:
                         self._control_from_trajectory(traj, odom, now)
+                        # HTTP callback may block timer scheduling; force one
+                        # mux cycle so overlay and output cmd_vel stay fresh.
+                        self._publish_muxed_cmd()
                 except Exception:
                     self.get_logger().info(
                         f"server raw response: {body[:500]}"
                     )
+
+            if self._vis_enabled and traj is not None:
+                self._show_vis(rgb, traj)
+            else:
+                self._show_vis(rgb)
 
         except req_exc.ConnectionError as exc:
             self.get_logger().error(
@@ -978,6 +1113,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--server-host", type=str, default="10.12.120.101")
     parser.add_argument("--server-port", type=int, default=8888)
+    parser.add_argument(
+        "--pp-config",
+        type=str,
+        default="configs/robots/pp_controller.yaml",
+        help="YAML file for pure pursuit/controller parameters",
+    )
     parser.add_argument("--send-hz", type=float, default=5.0)
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--reset-timeout", type=float, default=120.0)
@@ -1046,7 +1187,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--autonomy-default-enabled",
         action="store_true",
+        default=True,
         help="Start with autonomy source enabled",
+    )
+    parser.add_argument(
+        "--autonomy-default-disabled",
+        dest="autonomy_default_enabled",
+        action="store_false",
+        help="Start with teleop source enabled",
     )
 
     parser.add_argument(
