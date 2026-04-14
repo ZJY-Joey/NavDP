@@ -102,6 +102,7 @@ class NavDPRos2BagRunner(Node):
         self._teleop_cmd_w = 0.0
         self._teleop_cmd_time = 0.0
         self._last_watchdog_warn_time = 0.0
+        self._last_turn_like_log_time = 0.0
         self._lock = threading.Lock()
 
         self._load_pp_config(self.pp_config)
@@ -440,6 +441,24 @@ class NavDPRos2BagRunner(Node):
             return last - max_delta
         return target
 
+    @staticmethod
+    def _is_turn_like_trajectory(pts: np.ndarray) -> bool:
+        """Detect degenerate trajectories like [[0, 1, yaw], ...].
+
+        These trajectories keep almost fixed XY and usually mean "turn a bit"
+        is safer than tracking with normal forward speed.
+        """
+        if pts.shape[0] < 2:
+            return False
+
+        x_vals = pts[:, 0]
+        y_vals = pts[:, 1]
+        x_span = float(np.max(x_vals) - np.min(x_vals))
+        y_span = float(np.max(y_vals) - np.min(y_vals))
+        mean_dist = float(np.mean(np.hypot(x_vals, y_vals)))
+
+        return x_span < 0.05 and y_span < 0.05 and mean_dist > 0.2
+
     def _publish_cmd(self, v_cmd: float, w_cmd: float) -> None:
         if self._cmd_pub is None:
             return
@@ -549,6 +568,26 @@ class NavDPRos2BagRunner(Node):
         pts = self._extract_traj_pose(trajectory)
         if pts is None or pts.shape[0] == 0:
             self._publish_stop_cmd()
+            return
+
+        if self._is_turn_like_trajectory(pts):
+            target = pts[-1]
+            x = float(target[0])
+            y = float(target[1])
+            alpha = math.atan2(y, x)
+
+            self._algo_cmd_v = 0.0
+            self._algo_cmd_w = self._clamp(
+                self.pp_gain_w * alpha, -0.25, 0.25
+            )
+            self._algo_cmd_time = now
+
+            if now - self._last_turn_like_log_time > 1.0:
+                self.get_logger().info(
+                    "Detected turn-like trajectory (near-fixed XY), "
+                    "using gentle turning command"
+                )
+                self._last_turn_like_log_time = now
             return
 
         current_speed = abs(self._last_cmd_v)
